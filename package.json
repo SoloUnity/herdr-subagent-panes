@@ -1,0 +1,17 @@
+{
+  "name": "herdr-subagent-panes",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/SoloUnity/herdr-subagent-panes",
+  "exports": {
+    ".": "./index.js",
+    "./tui": "./tui.js"
+  },
+  "scripts": {
+    "test": "node --experimental-vm-modules --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
