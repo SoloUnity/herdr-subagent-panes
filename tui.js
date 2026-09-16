@@ -7,7 +7,24 @@ const CHILD_PANE_ENV = "OPENCODE_HERDR_SUBAGENT_PANE";
 const CLOSE_ATTEMPTS = 3;
 const CLOSE_RETRY_MS = 1_000;
 const REPORT_SOURCE = "herdr:opencode-subagent-panes";
+const METADATA_SOURCE = "herdr:opencode-subagent-metadata";
+const PRIMARY_METADATA_SOURCE = "herdr:opencode-primary-metadata";
 const REPORT_RETRY_MS = 500;
+const TITLE_RETRY_MS = 1_000;
+const TITLE_POLL_MS = 100;
+const NAMING_ATTEMPTS = 3;
+const LABEL_LIMIT = 80;
+
+function sanitize(value) {
+  const text = typeof value === "string" ? value.replaceAll(/[\u0000-\u001f\u007f]/g, " ").trim() : "";
+  return text || undefined;
+}
+
+function sidebarLabel(prefix, value) {
+  const text = sanitize(value);
+  // Herdr counts Unicode code points, not UTF-16 code units.
+  return text ? Array.from(`${prefix} - ${text}`).slice(0, LABEL_LIMIT).join("") : undefined;
+}
 
 function isPaneID(value) {
   return typeof value === "string" && /^w[\w-]+:p[\w-]+$/.test(value);
@@ -134,6 +151,24 @@ export default {
     let commandPrefix;
     let parentShellPID;
     let reportSequence = Date.now() * 1000;
+    let metadataSequence = Date.now() * 1000;
+    let primarySequence = Date.now() * 1000;
+    let primaryLabel;
+    let primaryRoot;
+    let primaryRequest;
+    let primaryPending = false;
+    let primaryRetry;
+    let primaryStartup;
+    // Workspace title state. The label follows the selected root session.
+    let parentTerminalID;
+    let workspaceLabel;
+    let titleRequest;
+    let titlePending = false;
+    let titleRetry;
+    let titlePoll;
+    // `session.updated` can arrive before the cache changes. Keep the event
+    // copy until the cache agrees, so a late snapshot cannot restore old names.
+    const updated = new Map();
 
     const warn = (message) => {
       console.warn(`herdr-subagent-panes: ${message}`);
@@ -164,6 +199,12 @@ export default {
     } catch (error) {
       warn(`Disabled: ${error.message}`);
       return;
+    }
+    try {
+      parentTerminalID = (await runHerdr(["pane", "get", parentPaneID], true)).pane?.terminal_id;
+    } catch (error) {
+      // Naming must not prevent worker creation if an inspect request fails.
+      warn(`Could not read the parent terminal for naming: ${error.message}`);
     }
 
     const enqueue = (operation) => {
@@ -200,15 +241,238 @@ export default {
     const cancelReportTimers = (child) => {
       clearTimeout(child.reportRetry);
       clearTimeout(child.startupReport);
+      clearTimeout(child.metadataRetry);
       child.reportRetry = undefined;
       child.startupReport = undefined;
+      child.metadataRetry = undefined;
     };
 
     const forgetPane = (child) => {
       child.pane = undefined;
       child.ready = false;
       child.lastReport = undefined;
+      child.lastMetadata = undefined;
+      child.lastPaneLabel = undefined;
+      child.metadataRequest = undefined;
       cancelReportTimers(child);
+    };
+
+    const sessionInfo = (sessionID) => {
+      const cached = context.data.session.get(sessionID);
+      const event = updated.get(sessionID);
+      if (!event) return cached;
+      if (cached && cached.title === event.title && cached.agent === event.agent) {
+        updated.delete(sessionID);
+        return cached;
+      }
+      return event;
+    };
+
+    const selectedTitle = () => {
+      const route = context.ui.router.current();
+      if (route.type !== "session" || route.sessionID === "dummy") return;
+      const rootID = context.data.session.root(route.sessionID);
+      const info = sessionInfo(rootID);
+      if (!info || info.parentID) return;
+      const title = sanitize(info.title);
+      if (title) return { routeID: route.sessionID, rootID, title };
+    };
+
+    const inspectParentForNaming = async (current) => {
+      const pane = (await runHerdr(["pane", "get", parentPaneID], true)).pane;
+      if (!current() || pane?.pane_id !== parentPaneID || !pane.terminal_id ||
+          (parentTerminalID && pane.terminal_id !== parentTerminalID)) return;
+      if ((await parentProcessInfo(parentPaneID)).shell_pid !== parentShellPID || !current()) return;
+      parentTerminalID ??= pane.terminal_id;
+      return pane;
+    };
+
+    const syncTitle = () => {
+      if (disposed) return;
+      const selected = selectedTitle();
+      const key = JSON.stringify(selected);
+      if (titleRequest?.key !== key) {
+        clearTimeout(titleRetry);
+        titleRetry = undefined;
+        titleRequest = { key, selected, attempts: 0 };
+      }
+      const request = titleRequest;
+      if (!selected || selected.title === workspaceLabel || titlePending || titleRetry ||
+          request.attempts >= NAMING_ATTEMPTS) return;
+      titlePending = true;
+      void enqueue(async () => {
+        const current = () => !disposed && titleRequest === request &&
+          JSON.stringify(selectedTitle()) === key;
+        try {
+          if (!current()) return;
+          request.attempts += 1;
+          const pane = await inspectParentForNaming(current);
+          if (!current()) return;
+          if (!pane?.workspace_id) {
+            request.attempts = NAMING_ATTEMPTS;
+            return;
+          }
+          await runHerdr(["workspace", "rename", pane.workspace_id, selected.title]);
+          if (disposed) return;
+          workspaceLabel = selected.title;
+        } catch (error) {
+          if (!current()) return;
+          warn(`Could not name the Herdr space: ${error.message}`);
+          if (request.attempts < NAMING_ATTEMPTS) {
+            titleRetry = setTimeout(() => {
+              titleRetry = undefined;
+              syncTitle();
+            }, TITLE_RETRY_MS);
+          }
+        } finally {
+          titlePending = false;
+        }
+      });
+    };
+
+    // The managed integration owns primary lifecycle and native session identity.
+    // Only attach a display label to its opencode:tui source here.
+    const reportPrimaryMetadata = (force = false) => {
+      if (disposed) return;
+      const selected = selectedTitle();
+      if (primaryRoot !== selected?.rootID) {
+        primaryRoot = selected?.rootID;
+        clearTimeout(primaryStartup);
+        primaryStartup = undefined;
+        if (selected) {
+          // Managed lifecycle selection may arrive after our initial metadata.
+          primaryStartup = setTimeout(() => {
+            primaryStartup = undefined;
+            reportPrimaryMetadata(true);
+          }, 1_000);
+        }
+      }
+      const key = JSON.stringify(selected);
+      if (primaryRequest?.key !== key) {
+        clearTimeout(primaryRetry);
+        primaryRetry = undefined;
+        primaryRequest = { key, attempts: 0 };
+      }
+      const display = sidebarLabel("Agent", selected?.title);
+      if (force) primaryLabel = undefined;
+      const request = primaryRequest;
+      if (!display || primaryLabel === display || primaryPending || primaryRetry ||
+          request.attempts >= NAMING_ATTEMPTS) return;
+      primaryPending = true;
+      void enqueue(async () => {
+        const current = () => !disposed && primaryRequest === request &&
+          JSON.stringify(selectedTitle()) === key;
+        try {
+          if (!current()) return;
+          request.attempts += 1;
+          const pane = await inspectParentForNaming(current);
+          if (!current()) return;
+          if (!pane) {
+            request.attempts = NAMING_ATTEMPTS;
+            return;
+          }
+          await runHerdr([
+            "pane", "report-metadata", parentPaneID,
+            "--source", PRIMARY_METADATA_SOURCE, "--agent", "opencode",
+            "--applies-to-source", "opencode:tui", "--display-agent", display,
+            "--clear-title", "--seq", String(++primarySequence),
+          ]);
+          if (disposed) return;
+          primaryLabel = display;
+          request.attempts = 0;
+        } catch (error) {
+          if (!current()) return;
+          if (isMissingPane(error)) request.attempts = NAMING_ATTEMPTS;
+          else warn(`Could not name the primary sidebar entry: ${error.message}`);
+          if (request.attempts < NAMING_ATTEMPTS) {
+            primaryRetry = setTimeout(() => {
+              primaryRetry = undefined;
+              reportPrimaryMetadata();
+            }, REPORT_RETRY_MS);
+          }
+        } finally {
+          primaryPending = false;
+        }
+      });
+    };
+
+    // Display metadata is independent of execution state and its sequence.
+    const reportMetadata = (child, force = false) => {
+      if (disposed || !child.ready || !child.pane) return;
+      const info = sessionInfo(child.sessionID);
+      const agent = sidebarLabel("Subagent", info?.agent);
+      if (!agent) return;
+      const key = agent;
+      if (child.metadataRequest?.key !== key) {
+        clearTimeout(child.metadataRetry);
+        child.metadataRetry = undefined;
+        child.metadataRequest = { key, attempts: 0 };
+      }
+      if (force) child.lastMetadata = undefined;
+      const request = child.metadataRequest;
+      if (child.lastMetadata === key || child.metadataPending || child.metadataRetry ||
+          request.attempts >= NAMING_ATTEMPTS) return;
+      child.metadataPending = true;
+      void enqueue(async () => {
+        const pane = child.pane;
+        const current = () => {
+          if (disposed || !child.ready || child.pane !== pane ||
+              children.get(child.sessionID) !== child || child.metadataRequest !== request) return false;
+          const latest = sessionInfo(child.sessionID);
+          return sidebarLabel("Subagent", latest?.agent) === key;
+        };
+        try {
+          if (!pane || !current()) return;
+          request.attempts += 1;
+          const inspected = (await runHerdr(["pane", "get", pane.pane_id], true)).pane;
+          if (!current()) return;
+          if (!pane.terminal_id || inspected?.terminal_id !== pane.terminal_id) {
+            request.attempts = NAMING_ATTEMPTS;
+            return;
+          }
+          if (child.lastPaneLabel !== agent) {
+            await runHerdr(["pane", "rename", pane.pane_id, agent]).then(() => {
+              child.lastPaneLabel = agent;
+            }).catch(() => {});
+            if (!current()) return;
+            const renamed = (await runHerdr(["pane", "get", pane.pane_id], true)).pane;
+            if (!current()) return;
+            if (renamed?.terminal_id !== pane.terminal_id) {
+              request.attempts = NAMING_ATTEMPTS;
+              return;
+            }
+          }
+          await runHerdr([
+            "pane", "report-metadata", pane.pane_id,
+            "--source", METADATA_SOURCE, "--agent", "opencode",
+            "--applies-to-source", REPORT_SOURCE, "--display-agent", agent,
+            "--clear-title", "--seq", String(++metadataSequence),
+          ]);
+          if (!current()) return;
+          child.lastMetadata = key;
+          request.attempts = 0;
+        } catch (error) {
+          if (!current()) return;
+          if (isMissingPane(error)) request.attempts = NAMING_ATTEMPTS;
+          else warn(`Could not name pane ${pane.pane_id}: ${error.message}`);
+          if (request.attempts < NAMING_ATTEMPTS) {
+            child.metadataRetry = setTimeout(() => {
+              child.metadataRetry = undefined;
+              reportMetadata(child);
+            }, REPORT_RETRY_MS);
+          }
+        } finally {
+          child.metadataPending = false;
+          // An update during the command wins over the old payload.
+          if (child.metadataRequest !== request) reportMetadata(child);
+        }
+      });
+    };
+
+    const syncNames = () => {
+      syncTitle();
+      reportPrimaryMetadata();
+      for (const child of children.values()) reportMetadata(child);
     };
 
     const inspectWorkers = async () => {
@@ -404,10 +668,10 @@ export default {
         }
         let splitAttempted = false;
         try {
-          let info = context.data.session.get(sessionID);
+          let info = sessionInfo(sessionID);
           if (!info?.location?.directory) {
             await context.data.session.sync(sessionID);
-            info = context.data.session.get(sessionID);
+            info = sessionInfo(sessionID);
           }
           if (!info?.parentID || !ownsParent(info.parentID)) {
             cancelClose(child);
@@ -454,18 +718,24 @@ export default {
           await balanceWorkers(needed);
           if (disposed || child.stopped) return;
 
-          const label = `subagent: ${info.agent ?? sessionID.slice(-8)}`;
-          await runHerdr(["pane", "rename", pane.pane_id, label.slice(0, 64)]).catch(() => {});
+          const label = sidebarLabel("Subagent", sessionInfo(sessionID)?.agent);
+          if (label) {
+            await runHerdr(["pane", "rename", pane.pane_id, label]).then(() => {
+              child.lastPaneLabel = label;
+            }).catch(() => {});
+          }
           if (disposed || child.stopped) return;
           const command = `${commandPrefix}opencode2 mini --session ${shellQuote(sessionID)}`;
           await runHerdr(["pane", "run", pane.pane_id, command]);
           if (disposed || child.stopped) return;
           child.ready = true;
           reportChild(child);
+          reportMetadata(child);
           // Process detection can reset an early report during shell startup.
           child.startupReport = setTimeout(() => {
             child.startupReport = undefined;
             reportChild(child, true);
+            reportMetadata(child, true);
           }, 1_000);
           void Promise.all([
             context.data.session.permission.sync(sessionID),
@@ -540,6 +810,11 @@ export default {
     };
 
     unsubscribers.push(
+      context.data.on("session.updated", ({ data }) => {
+        if (disposed || !data?.info || typeof data.sessionID !== "string") return;
+        updated.set(data.sessionID, { ...data.info });
+        syncNames();
+      }),
       context.data.on("session.created", (event) => startChild(event, true)),
       context.data.on("session.execution.started", (event) => startChild(event)),
       context.data.on("session.execution.succeeded", (event) => finishChild(event)),
@@ -551,12 +826,22 @@ export default {
       context.data.on("form.replied", ({ data }) => changeBlocker(data.sessionID, "form", data.id, false)),
       context.data.on("form.cancelled", ({ data }) => changeBlocker(data.sessionID, "form", data.id, false)),
       context.data.on("session.deleted", (event) => {
+        updated.delete(event.data?.sessionID);
         closeChild(event.data?.sessionID, 0, true);
       }),
     );
 
+    syncNames();
+    titlePoll = setInterval(syncNames, TITLE_POLL_MS);
+    titlePoll.unref?.();
+
     return async () => {
       disposed = true;
+      clearInterval(titlePoll);
+      clearTimeout(titleRetry);
+      clearTimeout(primaryRetry);
+      clearTimeout(primaryStartup);
+      updated.clear();
       for (const unsubscribe of unsubscribers) unsubscribe();
       for (const child of children.values()) {
         cancelClose(child);

@@ -17,15 +17,20 @@ async function fixture(settings = {}) {
   const calls = [];
   const warnings = [];
   const timers = new Map();
+  const intervals = new Map();
   const handlers = new Map();
-  const sessions = new Map();
+  const sessions = new Map((settings.sessions ?? []).map((info) => [info.id, info]));
   const statuses = new Map();
   const permissions = new Map();
   const forms = new Map();
   const panes = new Map();
   const overrides = new Map();
   const holds = new Map();
-  const state = { route: "ses_root", tabs: [], shellPID: 100, root: { type: "pane", pane_id: "w1:p1" } };
+  const state = {
+    route: settings.route ?? "ses_root", tabs: [], shellPID: 100,
+    parent: { pane_id: "w1:p1", workspace_id: "w1", terminal_id: "term_parent" },
+    root: { type: "pane", pane_id: "w1:p1" },
+  };
   let now = 0;
   let nextTimer = 0;
   let nextPane = 1;
@@ -49,11 +54,11 @@ async function fixture(settings = {}) {
   }
 
   function execFile(binary, args, options, callback) {
-    const op = binary === "herdr" ? args[1] : binary;
+    const op = binary === "herdr" ? (args[0] === "workspace" ? `workspace.${args[1]}` : args[1]) : binary;
     calls.push({ binary, args: [...args], options, op });
     const complete = () => {
       try {
-        const override = overrides.get(op)?.shift();
+        const override = overrides.get(`${op}:${args[2]}`)?.shift() ?? overrides.get(op)?.shift();
         if (override instanceof Error) throw override;
         if (typeof override === "string") return callback(null, override, "");
         if (op === "which") return callback(null, settings.prefixBinary ?? "/fake/devx\n", "");
@@ -73,6 +78,10 @@ async function fixture(settings = {}) {
             break;
           }
           case "get":
+            if (args[2] === "w1:p1") {
+              result = { pane: state.parent };
+              break;
+            }
             if (!panes.has(args[2])) throw notFound();
             result = { pane: panes.get(args[2]) };
             break;
@@ -98,6 +107,15 @@ async function fixture(settings = {}) {
           case "rename":
             result = { type: "pane_info", pane: panes.get(args[2]) };
             break;
+          case "workspace.rename":
+            assert.equal(args[2], state.parent.workspace_id);
+            result = { type: "workspace_info" };
+            break;
+          case "report-metadata":
+            if (args[2] === "w1:p1") {
+              result = { type: "pane_info", pane: state.parent };
+              break;
+            }
           case "report-agent":
           case "release-agent":
             if (!panes.has(args[2])) throw notFound();
@@ -113,7 +131,7 @@ async function fixture(settings = {}) {
         callback(error);
       }
     };
-    const held = holds.get(op)?.shift();
+    const held = holds.get(`${op}:${args[2]}`)?.shift() ?? holds.get(op)?.shift();
     if (held) held.release = complete;
     else complete();
   }
@@ -131,6 +149,12 @@ async function fixture(settings = {}) {
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
+    setInterval(fn, delay) {
+      const id = ++nextTimer;
+      intervals.set(id, { fn, at: now + delay, delay });
+      return id;
+    },
+    clearInterval: (id) => intervals.delete(id),
   });
   const module = new vm.SourceTextModule(source, { context: sandbox });
   const modules = {
@@ -179,7 +203,15 @@ async function fixture(settings = {}) {
         get: (id) => sessions.get(id),
         status: (id) => statuses.get(id) ?? "idle",
         sync: async (id) => settings.sync?.(id, sessions),
-        root: (id) => id === "ses_nested" ? "ses_root" : id,
+        root: (id) => {
+          const seen = new Set();
+          while (id && !seen.has(id)) {
+            seen.add(id);
+            const parent = sessions.get(id)?.parentID ?? (id === "ses_nested" ? "ses_root" : undefined);
+            if (!parent) return id;
+            id = parent;
+          }
+        },
         permission: {
           list: (id) => permissions.get(id),
           sync: async (id) => settings.syncPermissions?.(id, permissions),
@@ -198,8 +230,9 @@ async function fixture(settings = {}) {
   };
   const inaccessible = new Proxy({}, { get() { throw new Error("Inactive plugin accessed context"); } });
   const cleanup = await module.namespace.default.setup(settings.forbidContext ? inaccessible : context);
+  await flush();
   return {
-    calls, warnings, timers, handlers, sessions, statuses, permissions, forms, panes, state, cleanup,
+    calls, warnings, timers, intervals, handlers, sessions, statuses, permissions, forms, panes, state, cleanup,
     commands: (op) => calls.filter((call) => call.op === op),
     override(op, value) {
       const list = overrides.get(op) ?? [];
@@ -224,16 +257,27 @@ async function fixture(settings = {}) {
     async start(id = "ses_child") {
       await this.emit("session.execution.started", { sessionID: id });
     },
+    async update(id, changes, cache = true) {
+      const info = { ...sessions.get(id), ...changes, id };
+      if (cache) sessions.set(id, info);
+      await this.emit("session.updated", { sessionID: id, info });
+      return info;
+    },
+    async select(id) {
+      state.route = id;
+      await this.advance(100);
+    },
     async finish(id = "ses_child", outcome = "succeeded") {
       await this.emit(`session.execution.${outcome}`, { sessionID: id });
     },
     async advance(ms) {
       const target = now + ms;
       for (;;) {
-        const due = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+        const due = [...timers, ...intervals].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
         if (!due) break;
         now = due[1].at;
-        timers.delete(due[0]);
+        if (intervals.has(due[0])) due[1].at += due[1].delay;
+        else timers.delete(due[0]);
         due[1].fn();
         await flush();
       }
@@ -263,6 +307,7 @@ for (const [name, env] of [
     const f = await fixture({ env, forbidContext: true });
     assert.equal(f.calls.length, 0);
     assert.equal(f.timers.size, 0);
+    assert.equal(f.intervals.size, 0);
     assert.equal(f.handlers.size, 0);
   });
 }
@@ -1248,5 +1293,602 @@ test("a split response that repeats an existing worker ID is rejected", async ()
   assert.equal(f.commands("run").length, 1);
   assert.equal(f.commands("close").length, 0);
   assert.ok(f.warnings.some((message) => message.includes("valid child pane ID")));
+  await f.cleanup();
+});
+
+const rootSession = (id = "ses_root", title = "Review the project") => ({ id, title, agent: "build" });
+const spaceNames = (f) => f.commands("workspace.rename").map(({ args }) => args[3]);
+const metadataReports = (f, paneID = "w1:p2") => f.commands("report-metadata").filter(({ args }) => args[2] === paneID);
+const metadata = (f, paneID = "w1:p2") => metadataReports(f, paneID).map(({ args }) => ({
+  pane: args[2], agent: args[args.indexOf("--display-agent") + 1],
+  title: args.includes("--title") ? args[args.indexOf("--title") + 1] : undefined,
+}));
+
+test("initial root title names only the parent's space and unchanged polls do no Herdr work", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  assert.deepEqual(f.commands("workspace.rename")[0].args, ["workspace", "rename", "w1", "Review the project"]);
+  assert.equal(f.commands("rename").length, 0);
+  assert.equal(f.commands("report-agent").length, 0);
+  await f.advance(1000); // One primary startup reconciliation, not a title refresh.
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+  await f.cleanup();
+  assert.equal(f.intervals.size, 0);
+});
+
+test("a delayed root cache and a delayed title are found without Herdr polling", async () => {
+  const f = await fixture();
+  const count = f.calls.length;
+  await f.advance(1000);
+  f.sessions.set("ses_root", rootSession("ses_root", ""));
+  await f.advance(1000);
+  assert.equal(f.calls.length, count);
+  f.sessions.set("ses_root", rootSession());
+  await f.advance(100);
+  assert.deepEqual(spaceNames(f), ["Review the project"]);
+  await f.cleanup();
+});
+
+test("space title follows root switches, not enabled background tabs", async () => {
+  const f = await fixture({ tabsEnabled: true, sessions: [rootSession(), rootSession("ses_other", "Other project")] });
+  f.state.tabs = [{ sessionID: "ses_other" }];
+  await f.update("ses_other", { title: "Background title" });
+  assert.deepEqual(spaceNames(f), ["Review the project"]);
+  await f.select("ses_other");
+  await f.select("ses_root");
+  assert.deepEqual(spaceNames(f), ["Review the project", "Background title", "Review the project"]);
+  await f.cleanup();
+});
+
+test("selecting a nested child keeps the root title, never the child's title", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  await f.create("ses_child", { title: "Worker task" });
+  await f.create("ses_grandchild", { parentID: "ses_child", title: "Nested task" });
+  await f.select("ses_grandchild");
+  await f.update("ses_grandchild", { title: "Not a space name" });
+  assert.deepEqual(spaceNames(f), ["Review the project"]);
+  await f.update("ses_root", { title: "New root title" });
+  assert.deepEqual(spaceNames(f), ["Review the project", "New root title"]);
+  await f.cleanup();
+});
+
+test("a root title update before cache hydration cannot be undone by stale cache", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  const info = await f.update("ses_root", { title: "Event title" }, false);
+  await f.advance(1000);
+  assert.deepEqual(spaceNames(f), ["Review the project", "Event title"]);
+  f.sessions.set("ses_root", info);
+  await f.advance(100);
+  f.sessions.set("ses_root", { ...info, title: "Later cache title" });
+  await f.advance(100);
+  assert.deepEqual(spaceNames(f), ["Review the project", "Event title", "Later cache title"]);
+  await f.cleanup();
+});
+
+test("empty or absent root titles leave the space name unchanged", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  for (const title of ["", " \r\n ", undefined, null]) await f.update("ses_root", { title });
+  await f.advance(1000);
+  await f.select("dummy");
+  assert.deepEqual(spaceNames(f), ["Review the project"]);
+  await f.cleanup();
+});
+
+for (const operation of ["get", "process-info"]) {
+  test(`a route switch during title ${operation} prevents a stale rename`, async () => {
+    const f = await fixture({ sessions: [rootSession(), rootSession("ses_other", "Other project")] });
+    const gate = f.hold(operation);
+    await f.update("ses_root", { title: "Stale title" });
+    await f.select("ses_other");
+    gate.release();
+    await flush();
+    await f.advance(100);
+    assert.deepEqual(spaceNames(f), ["Review the project", "Other project"]);
+    await f.cleanup();
+  });
+}
+
+test("route A to B to A discards old queued title work", async () => {
+  const f = await fixture({ sessions: [rootSession(), rootSession("ses_other", "Other project")] });
+  const gate = f.hold("get");
+  await f.update("ses_root", { title: "New title" });
+  await f.select("ses_other");
+  await f.select("ses_root");
+  gate.release();
+  await flush();
+  await f.advance(100);
+  assert.deepEqual(spaceNames(f), ["Review the project", "New title"]);
+  await f.cleanup();
+});
+
+test("a title change during a rename is applied after the in-flight command", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  const gate = f.hold("workspace.rename");
+  await f.update("ses_root", { title: "First change" });
+  await f.update("ses_root", { title: "Latest change" });
+  gate.release();
+  await flush();
+  await f.advance(100);
+  assert.deepEqual(spaceNames(f), ["Review the project", "First change", "Latest change"]);
+  await f.cleanup();
+});
+
+for (const replacement of ["shell", "terminal", "missing workspace"]) {
+  test(`a parent ${replacement} identity failure prevents title writes`, async () => {
+    const f = await fixture({ sessions: [rootSession()] });
+    await f.advance(1000);
+    if (replacement === "shell") f.state.shellPID += 1;
+    else if (replacement === "terminal") f.state.parent.terminal_id = "replacement";
+    else delete f.state.parent.workspace_id;
+    await f.update("ses_root", { title: "Unsafe rename" });
+    const count = f.calls.length;
+    await f.advance(10000);
+    assert.equal(f.calls.length, count);
+    assert.deepEqual(spaceNames(f), ["Review the project"]);
+    await f.cleanup();
+  });
+}
+
+test("title failures have bounded retries and do not prevent workers", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  for (let i = 0; i < 3; i++) f.override("workspace.rename", new Error("unavailable"));
+  await f.update("ses_root", { title: "Failed title" });
+  await f.create();
+  await f.advance(10000);
+  assert.equal(f.commands("workspace.rename").length, 4);
+  assert.equal(f.panes.size, 1);
+  assert.equal(f.commands("close").length, 0);
+  assert.equal(f.timers.size, 0);
+  await f.update("ses_root", { title: "Recovered title" });
+  assert.equal(spaceNames(f).at(-1), "Recovered title");
+  await f.cleanup();
+});
+
+test("a transient space rename failure retries once and then stops", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  f.override("workspace.rename", new Error("timeout"));
+  await f.update("ses_root", { title: "Retry title" });
+  await f.advance(999);
+  assert.equal(f.commands("workspace.rename").length, 2);
+  await f.advance(1);
+  assert.equal(f.commands("workspace.rename").length, 3);
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+  await f.cleanup();
+});
+
+test("child metadata has only the exact subagent label with independent source and sequence", async () => {
+  const f = await fixture();
+  await f.create("ses_child", { agent: "explorer", title: "Find the files" });
+  const args = f.commands("report-metadata")[0].args;
+  assert.deepEqual(args.slice(0, -1), ["pane", "report-metadata", "w1:p2",
+    "--source", "herdr:opencode-subagent-metadata", "--agent", "opencode",
+    "--applies-to-source", "herdr:opencode-subagent-panes", "--display-agent", "Subagent - explorer",
+    "--clear-title", "--seq"]);
+  await f.start();
+  await f.emit("permission.asked", { sessionID: "ses_child", id: "per_1" });
+  await f.update("ses_child", { agent: "fixer" });
+  assert.deepEqual(reportStates(f), ["idle", "working", "blocked"]);
+  const reports = f.commands("report-metadata");
+  assert.equal(Number(reports[1].args.at(-1)), Number(reports[0].args.at(-1)) + 1);
+  assert.ok(f.calls.indexOf(reports[0]) > f.calls.indexOf(f.commands("report-agent")[0]));
+  assert.equal(f.commands("rename")[0].args[3], "Subagent - explorer");
+  assert.equal(f.commands("rename").at(-1).args[3], "Subagent - fixer");
+  await f.cleanup();
+});
+
+test("metadata is deduplicated except for the single startup resend after lifecycle", async () => {
+  const f = await fixture();
+  await f.create();
+  await f.create();
+  await f.update("ses_child", {});
+  await f.advance(999);
+  assert.equal(f.commands("report-metadata").length, 1);
+  await f.advance(1);
+  assert.equal(f.commands("report-metadata").length, 2);
+  const latestState = f.commands("report-agent").at(-1);
+  assert.ok(f.calls.indexOf(f.commands("report-metadata").at(-1)) > f.calls.indexOf(latestState));
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+  assert.equal(f.commands("split").length, 1);
+  await f.cleanup();
+});
+
+test("child metadata update before the cache changes is retained through startup", async () => {
+  const f = await fixture();
+  await f.create("ses_child", { title: "Old task" });
+  const info = await f.update("ses_child", { agent: "fixer", title: "New task" }, false);
+  await f.advance(2000);
+  assert.deepEqual(metadata(f).slice(1), [
+    { pane: "w1:p2", agent: "Subagent - fixer", title: undefined },
+    { pane: "w1:p2", agent: "Subagent - fixer", title: undefined },
+  ]);
+  f.sessions.set("ses_child", info);
+  await f.advance(100);
+  await f.update("ses_child", { title: "Next task" });
+  assert.equal(metadata(f).length, 3, "a child task title is not part of the sidebar label");
+  assert.equal(metadata(f).at(-1).title, undefined);
+  assert.deepEqual(reportStates(f), ["idle", "idle"]);
+  await f.cleanup();
+});
+
+test("metadata waits for a delayed agent and omits an absent title", async () => {
+  const f = await fixture();
+  await f.create("ses_child", { agent: undefined });
+  await f.advance(1000);
+  assert.equal(f.commands("report-metadata").length, 0);
+  f.sessions.set("ses_child", { ...f.sessions.get("ses_child"), agent: "explorer" });
+  await f.advance(100);
+  assert.deepEqual(metadata(f), [{ pane: "w1:p2", agent: "Subagent - explorer", title: undefined }]);
+  await f.cleanup();
+});
+
+test("metadata updates during creation are coalesced to the latest event", async () => {
+  const f = await fixture();
+  const gate = f.hold("split");
+  await f.create();
+  await f.update("ses_child", { agent: "fixer", title: "First task" }, false);
+  await f.update("ses_child", { agent: "oracle", title: "Latest task" }, false);
+  gate.release();
+  await flush();
+  assert.deepEqual(metadata(f), [{ pane: "w1:p2", agent: "Subagent - oracle", title: undefined }]);
+  await f.cleanup();
+});
+
+for (const operation of ["get", "report-metadata"]) {
+  test(`metadata update during ${operation} leaves the newest name last`, async () => {
+    const f = await fixture();
+    await f.create();
+    const gate = f.hold(operation);
+    await f.update("ses_child", { agent: "fixer" });
+    await f.update("ses_child", { agent: "oracle" }, false);
+    gate.release();
+    await flush();
+    assert.equal(metadata(f).at(-1).agent, "Subagent - oracle");
+    if (operation === "get") assert.equal(metadata(f).length, 2);
+    await f.cleanup();
+  });
+}
+
+test("metadata failures retry at most three times without closing workers", async () => {
+  const f = await fixture();
+  for (let i = 0; i < 3; i++) f.override("report-metadata", new Error("unavailable"));
+  await f.create();
+  await f.advance(10000);
+  assert.equal(f.commands("report-metadata").length, 3);
+  assert.equal(f.commands("close").length, 0);
+  assert.equal(f.panes.size, 1);
+  assert.equal(f.timers.size, 0);
+  await f.update("ses_child", { agent: "fixer" });
+  assert.equal(metadata(f).at(-1).agent, "Subagent - fixer");
+  await f.cleanup();
+});
+
+test("a cache-only metadata change during inspection does not dispatch the old name", async () => {
+  const f = await fixture();
+  await f.create();
+  const gate = f.hold("get");
+  await f.update("ses_child", { agent: "fixer" });
+  f.sessions.set("ses_child", { ...f.sessions.get("ses_child"), agent: "oracle" });
+  gate.release();
+  await flush();
+  assert.equal(metadata(f).length, 1);
+  await f.advance(100);
+  assert.equal(metadata(f).at(-1).agent, "Subagent - oracle");
+  await f.cleanup();
+});
+
+test("a worker replaced during metadata inspection receives no write", async () => {
+  const f = await fixture();
+  await f.create();
+  const gate = f.hold("get");
+  await f.update("ses_child", { agent: "fixer" });
+  f.panes.set("w1:p2", { pane_id: "w1:p2", terminal_id: "replacement" });
+  gate.release();
+  await flush();
+  await f.advance(10000);
+  assert.equal(metadata(f).length, 1);
+  await f.cleanup();
+});
+
+test("a metadata API error retries independently from lifecycle state", async () => {
+  const f = await fixture();
+  await f.create();
+  f.override("report-metadata", '{"error":{"code":"unavailable"}}');
+  await f.update("ses_child", { agent: "fixer" });
+  await f.advance(500);
+  assert.equal(f.commands("report-metadata").length, 3);
+  assert.deepEqual(reportStates(f), ["idle"]);
+  await f.cleanup();
+});
+
+test("replaced worker terminals receive no metadata, including retries and startup", async () => {
+  const f = await fixture();
+  await f.create();
+  f.panes.set("w1:p2", { pane_id: "w1:p2", terminal_id: "replacement" });
+  await f.update("ses_child", { agent: "fixer" });
+  await f.advance(10000);
+  assert.equal(f.commands("report-metadata").length, 1);
+  await f.cleanup();
+  assert.equal(f.commands("close").length, 0);
+});
+
+test("forgetting a worker clears metadata retries; reuse reports to a fresh pane", async () => {
+  const f = await fixture();
+  f.override("report-metadata", new Error("unavailable"));
+  await f.create();
+  await f.finish("ses_child", "interrupted");
+  await f.advance(10000);
+  assert.equal(f.commands("report-metadata").length, 1);
+  assert.equal(f.timers.size, 0);
+  await f.start();
+  assert.equal(metadata(f, "w1:p3").at(-1).pane, "w1:p3");
+  await f.cleanup();
+});
+
+test("unload clears naming retries, route polls, and update handlers", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  f.override("workspace.rename", new Error("unavailable"));
+  f.override("report-metadata", new Error("unavailable"));
+  await f.update("ses_root", { title: "Retry title" });
+  await f.create();
+  await f.cleanup();
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.handlers.size, 0);
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+});
+
+for (const target of ["title", "metadata"]) {
+  test(`unload during ${target} identity check prevents its write`, async () => {
+    const f = await fixture({ sessions: [rootSession()] });
+    await f.create();
+    const gate = f.hold("get");
+    await f.update(target === "title" ? "ses_root" : "ses_child", { title: "Do not send", agent: "fixer" });
+    const cleanup = f.cleanup();
+    gate.release();
+    await cleanup;
+    assert.equal(f.commands("workspace.rename").length, 1);
+    assert.equal(metadataReports(f).length, 1);
+    assert.equal(metadataReports(f, "w1:p1").length, 1);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.intervals.size, 0);
+  });
+}
+
+const primaryNames = (f) => metadata(f, "w1:p1").map((item) => item.agent);
+
+test("primary metadata has the exact label and only decorates the managed lifecycle source", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  const args = metadataReports(f, "w1:p1")[0].args;
+  assert.deepEqual(args.slice(0, -1), ["pane", "report-metadata", "w1:p1",
+    "--source", "herdr:opencode-primary-metadata", "--agent", "opencode",
+    "--applies-to-source", "opencode:tui", "--display-agent", "Agent - Review the project",
+    "--clear-title", "--seq"]);
+  await f.advance(1000);
+  assert.deepEqual(primaryNames(f), ["Agent - Review the project", "Agent - Review the project"]);
+  assert.equal(spaceNames(f).length, 1, "startup reconciliation is metadata-only");
+  const reports = metadataReports(f, "w1:p1");
+  assert.equal(Number(reports[1].args.at(-1)), Number(reports[0].args.at(-1)) + 1);
+  const count = f.calls.length;
+  await f.advance(10000);
+  await f.update("ses_root", {});
+  assert.equal(f.calls.length, count, "successful unchanged metadata has no network refresh");
+  await f.cleanup();
+  for (const op of ["report-agent", "report-agent-session", "release-agent", "rename"]) {
+    assert.equal(f.commands(op).length, 0, `primary ${op} is not owned here`);
+  }
+});
+
+test("workspace titles are full length; sidebar labels cap at 80 Unicode code points", async () => {
+  const title = `Plan ${"🦊".repeat(90)} complete`;
+  const agent = `tool-${"🚀".repeat(90)}`;
+  const f = await fixture({ sessions: [rootSession("ses_root", ` \t${title}\r\n `)] });
+  await f.create("ses_child", { agent, title: "Do not show this task title" });
+  assert.deepEqual(spaceNames(f), [title]);
+  const primary = primaryNames(f)[0];
+  const child = metadata(f)[0].agent;
+  assert.equal(primary, Array.from(`Agent - ${title}`).slice(0, 80).join(""));
+  assert.equal(child, Array.from(`Subagent - ${agent}`).slice(0, 80).join(""));
+  assert.equal(Array.from(primary).length, 80);
+  assert.equal(Array.from(child).length, 80);
+  assert.ok(primary.endsWith("🦊"));
+  assert.ok(child.endsWith("🚀"));
+  assert.equal(f.commands("rename")[0].args[3], child);
+  for (const { args } of f.commands("report-metadata")) {
+    assert.ok(args.includes("--clear-title"));
+    assert.ok(!args.includes("--title"));
+  }
+  await f.cleanup();
+});
+
+test("a root title change beyond the sidebar limit still updates the full space title", async () => {
+  const prefix = "a".repeat(90);
+  const f = await fixture({ sessions: [rootSession("ses_root", `${prefix} first`)] });
+  await f.advance(1000);
+  const count = metadataReports(f, "w1:p1").length;
+  await f.update("ses_root", { title: `${prefix} second` });
+  assert.deepEqual(spaceNames(f), [`${prefix} first`, `${prefix} second`]);
+  assert.equal(metadataReports(f, "w1:p1").length, count);
+  await f.cleanup();
+});
+
+test("delayed root data names the primary; selected children use the root title", async () => {
+  const f = await fixture();
+  await f.create("ses_child", { title: "Child task" });
+  await f.select("ses_child");
+  assert.deepEqual(primaryNames(f), []);
+  f.sessions.set("ses_root", rootSession());
+  await f.advance(100);
+  assert.deepEqual(primaryNames(f), ["Agent - Review the project"]);
+  assert.deepEqual(spaceNames(f), ["Review the project"]);
+  await f.advance(1000);
+  const count = metadataReports(f, "w1:p1").length;
+  await f.select("ses_root");
+  await f.select("ses_child");
+  await f.advance(2000);
+  assert.equal(metadataReports(f, "w1:p1").length, count);
+  await f.update("ses_child", { title: "Another child task" });
+  assert.equal(metadataReports(f, "w1:p1").length, count);
+  await f.update("ses_root", { title: "New root title" }, false);
+  await f.advance(1000);
+  assert.equal(primaryNames(f).at(-1), "Agent - New root title");
+  assert.equal(spaceNames(f).at(-1), "New root title");
+  await f.cleanup();
+});
+
+test("root switches name the primary and space, including startup reconciliation", async () => {
+  const f = await fixture({ sessions: [rootSession(), rootSession("ses_other", "Other project")] });
+  await f.advance(1000);
+  await f.select("ses_other");
+  assert.equal(primaryNames(f).at(-1), "Agent - Other project");
+  assert.equal(spaceNames(f).at(-1), "Other project");
+  const count = metadataReports(f, "w1:p1").length;
+  await f.advance(1000);
+  assert.equal(metadataReports(f, "w1:p1").length, count + 1);
+  await f.select("ses_root");
+  assert.equal(primaryNames(f).at(-1), "Agent - Review the project");
+  await f.cleanup();
+});
+
+test("a space rename failure does not prevent the primary or child metadata", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  await f.advance(1000);
+  for (let i = 0; i < 3; i++) f.override("workspace.rename", new Error("unavailable"));
+  await f.update("ses_root", { title: "Latest title" });
+  await f.create();
+  await f.advance(10000);
+  assert.equal(primaryNames(f).at(-1), "Agent - Latest title");
+  assert.equal(metadataReports(f, "w1:p1").length, 3);
+  assert.equal(metadata(f).at(-1).agent, "Subagent - explore");
+  assert.equal(f.commands("workspace.rename").length, 4);
+  assert.equal(f.commands("close").length, 0);
+  await f.cleanup();
+});
+
+test("primary metadata retries are bounded and independent of space and worker reports", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  await f.advance(1000);
+  const before = metadataReports(f, "w1:p1").length;
+  for (let i = 0; i < 3; i++) f.override("report-metadata:w1:p1", '{"error":{"code":"unavailable"}}');
+  await f.update("ses_root", { title: "Retry title" });
+  await f.create();
+  await f.start();
+  await f.advance(10000);
+  assert.equal(metadataReports(f, "w1:p1").length, before + 3);
+  assert.equal(spaceNames(f).at(-1), "Retry title");
+  assert.equal(f.commands("workspace.rename").length, 2);
+  assert.equal(metadata(f).at(-1).agent, "Subagent - explore");
+  assert.equal(reportStates(f).at(-1), "working");
+  assert.equal(f.commands("close").length, 0);
+  assert.equal(f.timers.size, 0);
+  await f.update("ses_root", { title: "Recovered title" });
+  assert.equal(primaryNames(f).at(-1), "Agent - Recovered title");
+  await f.cleanup();
+});
+
+test("a transient primary metadata error retries without renaming the space again", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  await f.advance(1000);
+  f.override("report-metadata:w1:p1", new Error("timeout"));
+  await f.update("ses_root", { title: "Retry title" });
+  await f.advance(499);
+  assert.equal(metadataReports(f, "w1:p1").length, 3);
+  await f.advance(1);
+  assert.equal(metadataReports(f, "w1:p1").length, 4);
+  assert.equal(spaceNames(f).length, 2);
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+  await f.cleanup();
+});
+
+for (const replacement of ["shell", "terminal"]) {
+  test(`primary ${replacement} replacement blocks startup metadata and later updates`, async () => {
+    const f = await fixture({ sessions: [rootSession()] });
+    if (replacement === "shell") f.state.shellPID += 1;
+    else f.state.parent.terminal_id = "replacement";
+    await f.advance(1000);
+    assert.equal(primaryNames(f).length, 1);
+    await f.update("ses_root", { title: "Do not send" });
+    const count = f.calls.length;
+    await f.advance(10000);
+    assert.equal(f.calls.length, count);
+    assert.equal(primaryNames(f).length, 1);
+    await f.cleanup();
+  });
+}
+
+for (const operation of ["get", "process-info"]) {
+  test(`route switch during primary startup ${operation} prevents stale metadata`, async () => {
+    const f = await fixture({ sessions: [rootSession(), rootSession("ses_other", "Other project")] });
+    const gate = f.hold(operation);
+    await f.advance(1000);
+    await f.select("ses_other");
+    gate.release();
+    await flush();
+    await f.advance(100);
+    assert.deepEqual(primaryNames(f), ["Agent - Review the project", "Agent - Other project"]);
+    assert.deepEqual(spaceNames(f), ["Review the project", "Other project"]);
+    await f.cleanup();
+  });
+}
+
+test("a primary title update during metadata dispatch leaves the newest label last", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  await f.advance(1000);
+  const gate = f.hold("report-metadata:w1:p1");
+  await f.update("ses_root", { title: "First change" });
+  await f.update("ses_root", { title: "Latest change" }, false);
+  gate.release();
+  await flush();
+  await f.advance(100);
+  assert.equal(primaryNames(f).at(-1), "Agent - Latest change");
+  assert.equal(spaceNames(f).at(-1), "Latest change");
+  await f.cleanup();
+});
+
+test("primary startup failure does not reset the retry budget", async () => {
+  const f = await fixture();
+  for (let i = 0; i < 3; i++) f.override("report-metadata:w1:p1", new Error("timeout"));
+  f.sessions.set("ses_root", rootSession());
+  await f.advance(10000);
+  assert.equal(metadataReports(f, "w1:p1").length, 3);
+  assert.equal(spaceNames(f).length, 1);
+  assert.equal(f.timers.size, 0);
+  await f.cleanup();
+});
+
+test("unload during primary startup inspection cancels metadata and all naming timers", async () => {
+  const f = await fixture({ sessions: [rootSession()] });
+  const gate = f.hold("get");
+  await f.advance(1000);
+  const cleanup = f.cleanup();
+  gate.release();
+  await cleanup;
+  assert.equal(primaryNames(f).length, 1);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.handlers.size, 0);
+  const count = f.calls.length;
+  await f.advance(10000);
+  assert.equal(f.calls.length, count);
+});
+
+test("worker replacement during a label rename prevents subsequent metadata", async () => {
+  const f = await fixture();
+  await f.create();
+  const gate = f.hold("rename");
+  await f.update("ses_child", { agent: "fixer" });
+  f.panes.set("w1:p2", { pane_id: "w1:p2", terminal_id: "replacement" });
+  gate.release();
+  await flush();
+  await f.advance(10000);
+  assert.equal(metadataReports(f).length, 1);
   await f.cleanup();
 });

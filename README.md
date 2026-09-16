@@ -7,7 +7,7 @@ state in the Herdr agent sidebar. By default, each pane runs:
 opencode2 mini --session <session-id>
 ```
 
-To use a launcher such as `devx`, set `commandPrefix` in the plugin options below.
+To use a launcher, set `commandPrefix` in the plugin options below.
 There is no built-in prefix. The plugin resolves a configured prefix executable
 once during setup and quotes each argument before adding it to the Mini command.
 
@@ -22,6 +22,7 @@ or separate plugin config file is required.
 - If configured, the prefix executable is available on `PATH` in the parent
   environment. Without a prefix, `opencode2` must be available in the child shell.
 - Herdr supports the 0.9 pane response format, including terminal IDs.
+  Sidebar naming requires `pane report-metadata` with `--clear-title` support.
 
 The plugin stays inactive outside Herdr and in generated child panes. If Herdr
 variables are present, it checks that the specified pane's shell is an ancestor
@@ -144,10 +145,54 @@ to load a reporting plugin. There is no child launch wrapper.
   only its own reporting source before closing a pane.
 - Generated panes receive `HERDR_AGENT=opencode` and
   `OPENCODE_HERDR_SUBAGENT_PANE=1`. The latter prevents recursive pane creation.
-  In this installation, it also bypasses Ghost Complete only in these panes.
 
-This plugin does not report the primary pane. Use the official Herdr OpenCode V2
-integration for that. Do not run the old child-state wrapper at the same time.
+The primary Herdr OpenCode V2 integration owns primary lifecycle reports and
+session identity. This plugin adds only primary display metadata. Do not run the
+old child-state wrapper at the same time.
+
+### Sidebar names and space title
+
+Child sidebar entries use `Subagent - <OpenCode agent name>`, for example
+`Subagent - explorer`. Child task and session titles are not used. The child pane
+label uses the same name. Child metadata uses `herdr:opencode-subagent-metadata`
+and applies only to `herdr:opencode-subagent-panes`.
+
+The main sidebar entry uses `Agent - <root OpenCode session title>`. Its metadata
+uses `herdr:opencode-primary-metadata` and applies only to the `opencode:tui`
+source. Primary labels require the primary integration to use that source. This
+plugin does not install or change the primary integration. If the source does not
+match, Herdr does not apply this metadata.
+
+Both metadata reporters clear the separate title field to remove old task titles
+and prevent duplicate titles. Each metadata source has its own sequence. The
+lifecycle agent remains `opencode`; status, native session IDs, and closure rules
+do not change.
+
+The Herdr space name uses the full selected root session title, without a prefix
+or length limit. Selecting a child uses its root title for both the space and the
+main sidebar entry. The plugin reads the workspace ID from the verified parent
+pane; it never selects the focused workspace. Empty or unavailable titles leave
+the existing name unchanged. Tabs are not renamed. Sidebar and child pane labels
+are limited to 80 Unicode code points, including the prefix. Emoji are not split.
+Control characters are replaced with spaces, and outer spaces are removed.
+
+The plugin checks the route and cache every 100 ms. It checks the parent shell
+and terminal before primary naming, and the worker terminal before child
+metadata. Child metadata follows the initial lifecycle report and is sent once
+more at startup. Primary metadata is also sent once more after root selection,
+in case the primary lifecycle source was not ready for the first report.
+After these startup checks, unchanged names cause no Herdr commands. Session
+update events take priority until the cache agrees.
+
+Space naming and primary metadata have separate retry and duplicate checks.
+Naming failures do not close workers. Failed names have at most three attempts;
+metadata retries wait 500 ms and space-title retries wait one second. Unload
+clears the naming timers and event handlers.
+
+No new options are required. After existing workers finish, close and reopen the
+full OpenCode TUI inside Herdr to load the changed plugin. Do not restart Herdr or
+the OpenCode service for this change. The exact prefixed labels have automated
+test coverage only; this revision has not been checked in a live Herdr session.
 
 Each TUI instance manages its own panes. Two full TUIs with the same session in
 their tabs can each open a pane for the same child. Cross-client pane selection is
@@ -156,7 +201,7 @@ not implemented; keep only one such TUI open if you want one pane per child.
 ## Options
 
 Set options in the global `~/.config/opencode/cli.json`, not `opencode.json`.
-For this installation, the entry is:
+For a checkout at `./plugins/herdr-subagent-panes`, use:
 
 ```json
 {
@@ -164,8 +209,7 @@ For this installation, the entry is:
     {
       "package": "./plugins/herdr-subagent-panes",
       "options": {
-        "mainPaneWidthPercent": 60,
-        "commandPrefix": ["devx"]
+        "mainPaneWidthPercent": 60
       }
     }
   ]
@@ -222,6 +266,11 @@ terminal replacement, and completion or unload during a split. State tests cover
 three independent children, pending permissions and forms, late cache updates,
 failed reports, and events received during launch or an in-flight report.
 
+Naming tests cover exact child and primary labels, full space titles, Unicode
+limits, root selection, delayed titles, nested sessions, stale caches, independent
+bounded retries, replaced terminals, changes during pending commands, and cleanup.
+All naming commands use fake Herdr responses.
+
 Layout tests cover a default 60%-width primary, custom widths and invalid options,
 three and six equal-height workers, closure at each position, replacement workers, concurrent creation,
 manual closure, unrelated panes, moved terminals, invalid responses, and timeouts.
@@ -231,32 +280,13 @@ stale pending requests, stops during creation and launch, replaced terminals,
 duplicate events, close retries, and restart during closure. These are automated
 event tests; they do not send keyboard input to the main TUI or Mini.
 
-Live verification on September 14, 2026 used Herdr 0.9.0 and OpenCode V2 beta
-18999. Three native subagents each ran `sleep 15` in parallel. With only one full
-TUI open, all three child panes reported `working`. A test form changed only its
-child to `blocked`; cancellation restored `working`. All three reported `idle`
-on completion, closed, and disappeared from the sidebar. No wrapper was used.
-
-Primary reporting also passed after a local v12 compatibility fix. The primary
-TUI uses a separate report source because Ghost Complete hides the OpenCode
-process required by Herdr's built-in source. See
-`~/.config/opencode/plugins/herdr-opencode/README.md` for the changes and test results.
-Normal-pane Ghost Complete settings were not changed.
-
-Before the width became configurable, the stacked layout passed a live Herdr test on
-September 14, 2026. In a 162-column test area, the primary kept 108 columns and the
-worker column used 54.
-Three workers each had 11 rows. Closing the middle worker gave the remaining
-workers 17 and 16 rows. A replacement restored three 11-row workers. Unload closed
-the workers and restored the full primary area. All test panes and empty test
-sessions were removed.
-
-This live test used the real plugin, Herdr, and Mini with empty OpenCode sessions
-and simulated lifecycle events. It made no model calls. To repeat it, run this
-only inside a disposable Herdr shell pane:
+The automated suite does not check the visible sidebar in a real Herdr session.
+A separate layout test uses real Herdr panes and Mini with empty OpenCode
+sessions and simulated lifecycle events. It makes no model calls. To run it,
+use only a disposable Herdr shell pane, from this repository directory:
 
 ```sh
-node ~/.config/opencode/plugins/herdr-subagent-panes/test/live-layout.mjs --disposable-pane
+node test/live-layout.mjs --disposable-pane
 ```
 
 ## API references
