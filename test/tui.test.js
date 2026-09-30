@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const source = await readFile(new URL("../tui.js", import.meta.url), "utf8");
@@ -20,14 +21,16 @@ async function fixture(settings = {}) {
   const intervals = new Map();
   const handlers = new Map();
   const sessions = new Map((settings.sessions ?? []).map((info) => [info.id, info]));
-  const statuses = new Map();
+  const statuses = new Map(Object.entries(settings.statuses ?? {}));
+  const active = new Map(Object.entries(settings.active ?? {}));
+  const activeReads = [];
   const permissions = new Map();
   const forms = new Map();
   const panes = new Map();
   const overrides = new Map();
   const holds = new Map();
   const state = {
-    route: settings.route ?? "ses_root", tabs: [], shellPID: 100,
+    route: settings.route ?? "ses_root", tabs: settings.tabs ?? [], shellPID: 100,
     parent: { pane_id: "w1:p1", workspace_id: "w1", terminal_id: "term_parent" },
     root: { type: "pane", pane_id: "w1:p1" },
   };
@@ -61,7 +64,8 @@ async function fixture(settings = {}) {
         const override = overrides.get(`${op}:${args[2]}`)?.shift() ?? overrides.get(op)?.shift();
         if (override instanceof Error) throw override;
         if (typeof override === "string") return callback(null, override, "");
-        if (op === "which") return callback(null, settings.prefixBinary ?? "/fake/devx\n", "");
+        if (op === "which") return callback(null, args[0] === "node"
+          ? settings.nodeBinary ?? "/fake/node\n" : settings.prefixBinary ?? "/fake/devx\n", "");
         if (op === "ps") return callback(null, settings.processes ?? "1 0\n100 1\n700 100\n", "");
         let result;
         switch (op) {
@@ -141,7 +145,11 @@ async function fixture(settings = {}) {
   });
 
   const sandbox = vm.createContext({
-    process: { env: settings.env ?? inside, argv: settings.argv ?? ["opencode2"], pid: 700 },
+    process: {
+      env: settings.env ?? inside, argv: settings.argv ?? ["opencode2"], pid: 700,
+      execPath: settings.execPath ?? "/fake/opencode-2.0.13",
+    },
+    URL,
     console: { warn: (message) => warnings.push(message) },
     setTimeout(fn, delay) {
       const id = ++nextTimer;
@@ -156,8 +164,16 @@ async function fixture(settings = {}) {
     },
     clearInterval: (id) => intervals.delete(id),
   });
-  const module = new vm.SourceTextModule(source, { context: sandbox });
+  const module = new vm.SourceTextModule(source, {
+    context: sandbox, initializeImportMeta: (meta) => { meta.url = "file:///plugin/tui.js"; },
+  });
   const modules = {
+    "./service.js": new vm.SyntheticModule(["serviceFile"], function () {
+      this.setExport("serviceFile", () => "/fake/state/opencode/service.json");
+    }, { context: sandbox }),
+    "node:url": new vm.SyntheticModule(["fileURLToPath"], function () {
+      this.setExport("fileURLToPath", fileURLToPath);
+    }, { context: sandbox }),
     "./layout.js": new vm.SourceTextModule(layoutSource, { context: sandbox }),
     "node:net": new vm.SyntheticModule(["default"], function () {
       this.setExport("default", {
@@ -194,6 +210,14 @@ async function fixture(settings = {}) {
   await module.evaluate();
   const context = {
     options: settings.options ?? {},
+    client: {
+      session: {
+        async active() {
+          activeReads.push(true);
+          return settings.readActive ? settings.readActive(active) : { data: Object.fromEntries(active) };
+        },
+      },
+    },
     data: {
       on(type, handler) {
         handlers.set(type, handler);
@@ -232,7 +256,12 @@ async function fixture(settings = {}) {
   const cleanup = await module.namespace.default.setup(settings.forbidContext ? inaccessible : context);
   await flush();
   return {
-    calls, warnings, timers, intervals, handlers, sessions, statuses, permissions, forms, panes, state, cleanup,
+    calls, warnings, timers, intervals, handlers, sessions, statuses, active, activeReads, permissions, forms, panes, state, cleanup,
+    async reload() {
+      await this.cleanup();
+      this.cleanup = await module.namespace.default.setup(context);
+      await flush();
+    },
     commands: (op) => calls.filter((call) => call.op === op),
     override(op, value) {
       const list = overrides.get(op) ?? [];
@@ -333,9 +362,10 @@ test("configured devx prefix is resolved once", async () => {
   const f = await fixture({ options: { commandPrefix: ["devx"] } });
   await f.create();
   await f.create("ses_other");
-  assert.equal(f.commands("which").length, 1);
+  assert.equal(f.commands("which").length, 2);
   assert.deepEqual(f.commands("which")[0].args, ["devx"]);
-  assert.match(f.commands("run")[0].args[3], /^'\/fake\/devx' opencode2 mini --session 'ses_child'$/);
+  assert.equal(f.commands("run")[0].args[3],
+    "'/fake/node' '/plugin/mini.mjs' '/fake/state/opencode/service.json' 'ses_child' '/fake/devx' '/fake/opencode-2.0.13'");
   await f.cleanup();
 });
 
@@ -346,11 +376,12 @@ test("a missing configured prefix executable disables the plugin", async () => {
 });
 
 for (const [name, options] of [["omitted", {}], ["empty", { commandPrefix: [] }]]) {
-  test(`${name} prefix launches Mini directly without executable discovery`, async () => {
+  test(`${name} prefix launches the attach-only client with the parent executable`, async () => {
     const f = await fixture({ options });
     await f.create();
-    assert.equal(f.commands("which").length, 0);
-    assert.equal(f.commands("run")[0].args[3], "opencode2 mini --session 'ses_child'");
+    assert.deepEqual(f.commands("which").map((call) => call.args), [["node"]]);
+    assert.equal(f.commands("run")[0].args[3],
+      "'/fake/node' '/plugin/mini.mjs' '/fake/state/opencode/service.json' 'ses_child' '/fake/opencode-2.0.13'");
     await f.cleanup();
   });
 }
@@ -361,7 +392,7 @@ test("a custom prefix preserves arguments and quotes shell characters", async ()
   await f.create();
   assert.deepEqual(f.commands("which")[0].args, ["wrapper"]);
   assert.equal(f.commands("run")[0].args[3],
-    "'/fake/wrapper' '--label' 'space '\\'' $(not-a-command); &' opencode2 mini --session 'ses_child'");
+    "'/fake/node' '/plugin/mini.mjs' '/fake/state/opencode/service.json' 'ses_child' '/fake/wrapper' '--label' 'space '\\'' $(not-a-command); &' '/fake/opencode-2.0.13'");
   assert.deepEqual(commandPrefix, ["wrapper", "--label", "space ' $(not-a-command); &"]);
   await f.cleanup();
 });
@@ -403,6 +434,216 @@ test("duplicate creation and start events create one pane", async () => {
   assert.equal(f.commands("split").length, 1);
   assert.equal(f.commands("run").length, 1);
   await f.cleanup();
+});
+
+test("a missing Node runtime prevents an unusable child pane", async () => {
+  const f = await fixture({ nodeBinary: "" });
+  assert.equal(f.handlers.size, 0);
+  assert.equal(f.commands("split").length, 0);
+  assert.match(f.warnings[0], /Node.js/);
+});
+
+const running = { type: "running" };
+const recoveryChild = (id = "ses_recovered", parentID = "ses_root") => ({
+  id, parentID, agent: "explore", location: { directory: "/recovered/project" },
+});
+
+test("setup restores only active children owned by this TUI", async () => {
+  const f = await fixture({
+    active: { ses_recovered: running, ses_other: running, ses_root: running },
+    sessions: [recoveryChild(), recoveryChild("ses_other", "ses_elsewhere"),
+      recoveryChild("ses_idle"), { id: "ses_root" }, { id: "ses_elsewhere" }],
+  });
+  assert.equal(f.commands("split").length, 1);
+  assert.equal(f.commands("run")[0].args[3],
+    "'/fake/node' '/plugin/mini.mjs' '/fake/state/opencode/service.json' 'ses_recovered' '/fake/opencode-2.0.13'");
+  assert.deepEqual(reportStates(f), ["working"]);
+  await f.advance(10_000);
+  assert.equal(f.activeReads.length, 1, "normal name polling must not query the service");
+  await f.cleanup();
+});
+
+test("recovery hydrates missing children and their nested ancestry", async () => {
+  const durable = new Map([
+    ["ses_leaf", recoveryChild("ses_leaf", "ses_middle")],
+    ["ses_middle", recoveryChild("ses_middle")], ["ses_root", { id: "ses_root" }],
+  ]);
+  const synced = [];
+  const f = await fixture({
+    active: { ses_leaf: running },
+    sync(id, sessions) { synced.push(id); sessions.set(id, durable.get(id)); },
+  });
+  assert.deepEqual(synced, ["ses_leaf", "ses_middle", "ses_root"]);
+  assert.equal(f.commands("split").length, 1);
+  assert.ok(f.commands("split")[0].args.includes("/recovered/project"));
+  await f.cleanup();
+});
+
+test("reload restores running children without a new execution event", async () => {
+  const f = await fixture({
+    active: { ses_recovered: running }, sessions: [recoveryChild(), { id: "ses_root" }],
+  });
+  assert.equal(f.panes.size, 1);
+  await f.reload();
+  assert.equal(f.commands("close").length, 1);
+  assert.equal(f.commands("split").length, 2);
+  assert.equal(f.panes.size, 1);
+  assert.ok(f.handlers.has("server.connected"));
+  await f.cleanup();
+  assert.equal(f.handlers.size, 0);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.intervals.size, 0);
+});
+
+test("reconnection recovers missing workers without duplicating tracked ones", async () => {
+  const f = await fixture({ sessions: [{ id: "ses_root" }] });
+  await f.create();
+  f.sessions.set("ses_recovered", recoveryChild());
+  f.active.set("ses_child", running);
+  f.active.set("ses_recovered", running);
+  await f.emit("server.connected", {});
+  await f.emit("server.connected", {});
+  assert.equal(f.commands("split").length, 2);
+  assert.equal(f.commands("run").length, 2);
+  await f.cleanup();
+});
+
+test("recovery waits for session selection and includes newly enabled tabs", async () => {
+  const f = await fixture({
+    route: "dummy", tabsEnabled: true,
+    active: { ses_recovered: running, ses_tab_child: running },
+    sessions: [recoveryChild(), recoveryChild("ses_tab_child", "ses_tab"),
+      { id: "ses_root" }, { id: "ses_tab" }],
+  });
+  assert.equal(f.activeReads.length, 0);
+  await f.select("ses_root");
+  assert.equal(f.panes.size, 1);
+  f.state.tabs = [{ sessionID: "ses_tab" }];
+  await f.advance(100);
+  assert.equal(f.panes.size, 2);
+  await f.cleanup();
+});
+
+for (const type of ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.deleted"]) {
+  test(`${type} during active lookup prevents a stale recovery`, async () => {
+    let reply;
+    const f = await fixture({
+      sessions: [recoveryChild(), { id: "ses_root" }],
+      readActive: () => new Promise((resolve) => { reply = resolve; }),
+    });
+    await f.emit(type, { sessionID: "ses_recovered" });
+    reply({ data: { ses_recovered: running } });
+    await flush();
+    assert.equal(f.commands("split").length, 0);
+    await f.cleanup();
+  });
+}
+
+test("completion during cache hydration prevents a stale recovery", async () => {
+  let hydrate;
+  const f = await fixture({
+    active: { ses_recovered: running }, sessions: [{ id: "ses_root" }],
+    sync: (id, sessions) => new Promise((resolve) => {
+      hydrate = () => { sessions.set(id, recoveryChild(id)); resolve(); };
+    }),
+  });
+  await f.emit("session.execution.succeeded", { sessionID: "ses_recovered" });
+  hydrate();
+  await flush();
+  assert.equal(f.commands("split").length, 0);
+  await f.cleanup();
+});
+
+test("a live start during recovery still creates only one pane", async () => {
+  let reply;
+  const f = await fixture({ readActive: () => new Promise((resolve) => { reply = resolve; }) });
+  await f.create();
+  await f.start();
+  reply({ data: { ses_child: running } });
+  await flush();
+  assert.equal(f.commands("split").length, 1);
+  await f.cleanup();
+});
+
+test("recovery checks the latest ownership after an in-flight request", async () => {
+  let reply;
+  let reads = 0;
+  const f = await fixture({
+    sessions: [recoveryChild(), { id: "ses_root" }],
+    readActive: () => ++reads === 1 ? new Promise((resolve) => { reply = resolve; }) : { data: {} },
+  });
+  await f.select("ses_elsewhere");
+  reply({ data: { ses_recovered: running } });
+  await flush();
+  assert.equal(f.commands("split").length, 0);
+  assert.equal(reads, 2);
+  await f.cleanup();
+});
+
+test("active lookup failures retry at most three times without blocking new workers", async () => {
+  const f = await fixture({ readActive() { throw new Error("offline"); } });
+  await f.create();
+  await f.advance(10_000);
+  assert.equal(f.activeReads.length, 3);
+  assert.equal(f.panes.size, 1);
+  await f.cleanup();
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.intervals.size, 0);
+});
+
+test("a transient active lookup failure recovers on retry", async () => {
+  let reads = 0;
+  const f = await fixture({
+    sessions: [recoveryChild(), { id: "ses_root" }],
+    readActive() {
+      if (++reads === 1) throw new Error("reconnecting");
+      return { data: { ses_recovered: running } };
+    },
+  });
+  assert.equal(f.panes.size, 0);
+  await f.advance(1_000);
+  assert.equal(f.panes.size, 1);
+  await f.advance(10_000);
+  assert.equal(reads, 2);
+  await f.cleanup();
+});
+
+test("one missing active session does not prevent recovery of other workers", async () => {
+  const f = await fixture({
+    active: { ses_missing: running, ses_recovered: running },
+    sessions: [recoveryChild(), { id: "ses_root" }],
+  });
+  assert.equal(f.panes.size, 1);
+  await f.advance(10_000);
+  assert.equal(f.activeReads.length, 3);
+  assert.equal(f.commands("split").length, 1);
+  await f.cleanup();
+});
+
+test("recovery supports unwrapped client responses and hydrates blockers", async () => {
+  const f = await fixture({
+    readActive: () => ({ ses_recovered: running }),
+    sessions: [recoveryChild(), { id: "ses_root" }],
+    syncForms(id, forms) { forms.set(id, [{ id: "frm_pending" }]); },
+  });
+  assert.equal(f.panes.size, 1);
+  assert.equal(reportStates(f).at(-1), "blocked");
+  await f.cleanup();
+});
+
+test("unload during recovery prevents late panes and retry timers", async () => {
+  let reply;
+  const f = await fixture({
+    sessions: [recoveryChild(), { id: "ses_root" }],
+    readActive: () => new Promise((resolve) => { reply = resolve; }),
+  });
+  await f.cleanup();
+  reply({ data: { ses_recovered: running } });
+  await flush();
+  assert.equal(f.commands("split").length, 0);
+  assert.equal(f.handlers.size, 0);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.intervals.size, 0);
 });
 
 test("each pane uses the child directory, marker, and verified split target without focus", async () => {
@@ -866,11 +1107,15 @@ test("an explicit API rejection does not block later creation", async () => {
   await f.cleanup();
 });
 
-test("shell quoting protects the configured devx path and session ID", async () => {
-  const f = await fixture({ prefixBinary: "/fake/O'Brien tools/devx\n", options: { commandPrefix: ["devx"] } });
+test("the launcher quotes the runtime, parent executable, prefix, and session ID", async () => {
+  const f = await fixture({
+    prefixBinary: "/fake/O'Brien tools/devx\n", options: { commandPrefix: ["devx"] },
+    nodeBinary: "/fake/node's path/node\n", execPath: "/nix/store/parent's version/opencode2",
+    argv: ["/different/version/opencode2"],
+  });
   await f.create("ses_quote'$(do-not-run)");
   assert.equal(f.commands("run")[0].args[3],
-    "'/fake/O'\\''Brien tools/devx' opencode2 mini --session 'ses_quote'\\''$(do-not-run)'");
+    "'/fake/node'\\''s path/node' '/plugin/mini.mjs' '/fake/state/opencode/service.json' 'ses_quote'\\''$(do-not-run)' '/fake/O'\\''Brien tools/devx' '/nix/store/parent'\\''s version/opencode2'");
   await f.cleanup();
 });
 

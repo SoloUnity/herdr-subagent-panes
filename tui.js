@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { requestLayout, workerStack } from "./layout.js";
+import { serviceFile } from "./service.js";
 
 const execFileAsync = promisify(execFile);
 const CHILD_PANE_ENV = "OPENCODE_HERDR_SUBAGENT_PANE";
@@ -14,6 +16,8 @@ const TITLE_RETRY_MS = 1_000;
 const TITLE_POLL_MS = 100;
 const NAMING_ATTEMPTS = 3;
 const LABEL_LIMIT = 80;
+const RECOVERY_RETRY_MS = 1_000;
+const RECOVERY_ATTEMPTS = 3;
 
 function sanitize(value) {
   const text = typeof value === "string" ? value.replaceAll(/[\u0000-\u001f\u007f]/g, " ").trim() : "";
@@ -144,6 +148,10 @@ export default {
     );
     const children = new Map();
     const unsubscribers = [];
+    const miniExecutable = shellQuote(process.execPath);
+    const miniLauncher = shellQuote(fileURLToPath(new URL("./mini.mjs", import.meta.url)));
+    const registrationFile = shellQuote(serviceFile(context.app?.channel));
+    let nodeExecutable;
     let disposed = false;
     let openingDisabled = false;
     let warned = false;
@@ -166,6 +174,13 @@ export default {
     let titlePending = false;
     let titleRetry;
     let titlePoll;
+    let ownedSessionsKey;
+    let recoveryPending = false;
+    let recoveryRequested = false;
+    let recoveryAttempts = 0;
+    let recoveryRetry;
+    let eventSequence = 0;
+    const sessionEvents = new Map();
     // `session.updated` can arrive before the cache changes. Keep the event
     // copy until the cache agrees, so a late snapshot cannot restore old names.
     const updated = new Map();
@@ -196,6 +211,10 @@ export default {
       parentShellPID = (await parentProcessInfo(parentPaneID)).shell_pid;
       await verifyAncestry(parentShellPID);
       commandPrefix = await resolveCommandPrefix(context.options?.commandPrefix);
+      const { stdout } = await execFileAsync("which", ["node"], { encoding: "utf8", timeout: 2_000 });
+      const binary = stdout.trim().split("\n")[0];
+      if (!binary) throw new Error("Node.js is not on PATH");
+      nodeExecutable = shellQuote(binary);
     } catch (error) {
       warn(`Disabled: ${error.message}`);
       return;
@@ -725,7 +744,7 @@ export default {
             }).catch(() => {});
           }
           if (disposed || child.stopped) return;
-          const command = `${commandPrefix}opencode2 mini --session ${shellQuote(sessionID)}`;
+          const command = `${nodeExecutable} ${miniLauncher} ${registrationFile} ${shellQuote(sessionID)} ${commandPrefix}${miniExecutable}`;
           await runHerdr(["pane", "run", pane.pane_id, command]);
           if (disposed || child.stopped) return;
           child.ready = true;
@@ -809,30 +828,109 @@ export default {
       closeChild(child.sessionID, 0, true);
     };
 
+    const observe = (handler) => (event) => {
+      if (recoveryPending && typeof event.data?.sessionID === "string") {
+        sessionEvents.set(event.data.sessionID, ++eventSequence);
+      }
+      handler(event);
+    };
+
+    const hydrateFamily = async (sessionID) => {
+      const seen = new Set();
+      for (let id = sessionID; id && !disposed && !seen.has(id);) {
+        seen.add(id);
+        if (!context.data.session.get(id)) await context.data.session.sync(id);
+        const info = context.data.session.get(id);
+        if (!info) throw new Error(`Session ${id} is not available yet`);
+        id = info.parentID;
+      }
+    };
+
+    const recoverChildren = async () => {
+      if (disposed || recoveryPending || !ownedRootSessions().size) return;
+      recoveryPending = true;
+      recoveryRequested = false;
+      recoveryAttempts += 1;
+      const sequence = eventSequence;
+      let failed = false;
+      try {
+        const response = await context.client.session.active();
+        // CLI client releases expose either the HTTP envelope or its data.
+        const active = response.data ?? response;
+        for (const [sessionID, status] of Object.entries(active)) {
+          if (disposed) return;
+          if (status.type !== "running" || children.has(sessionID)) continue;
+          try {
+            await hydrateFamily(sessionID);
+            // Live events win over the snapshot, including a completion or
+            // deletion received while the request or cache sync was in flight.
+            if (disposed || (sessionEvents.get(sessionID) ?? 0) > sequence || children.has(sessionID)) continue;
+            startChild({ data: { sessionID } });
+          } catch (error) {
+            failed = true;
+            if (!disposed) warn(`Could not recover ${sessionID}: ${error.message}`);
+          }
+        }
+      } catch (error) {
+        failed = true;
+        if (!disposed) warn(`Could not read active subagents: ${error.message}`);
+      } finally {
+        recoveryPending = false;
+        sessionEvents.clear();
+        if (!disposed) {
+          if (recoveryRequested) void recoverChildren();
+          else if (failed && recoveryAttempts < RECOVERY_ATTEMPTS) {
+            recoveryRetry = setTimeout(() => {
+              recoveryRetry = undefined;
+              void recoverChildren();
+            }, RECOVERY_RETRY_MS);
+          }
+        }
+      }
+    };
+
+    const requestRecovery = () => {
+      if (disposed) return;
+      clearTimeout(recoveryRetry);
+      recoveryRetry = undefined;
+      recoveryAttempts = 0;
+      recoveryRequested = true;
+      void recoverChildren();
+    };
+
+    const syncState = () => {
+      syncNames();
+      const key = JSON.stringify([...ownedRootSessions()].sort());
+      if (key === ownedSessionsKey) return;
+      ownedSessionsKey = key;
+      requestRecovery();
+    };
+
     unsubscribers.push(
+      context.data.on("server.connected", requestRecovery),
       context.data.on("session.updated", ({ data }) => {
         if (disposed || !data?.info || typeof data.sessionID !== "string") return;
         updated.set(data.sessionID, { ...data.info });
         syncNames();
       }),
-      context.data.on("session.created", (event) => startChild(event, true)),
-      context.data.on("session.execution.started", (event) => startChild(event)),
-      context.data.on("session.execution.succeeded", (event) => finishChild(event)),
-      context.data.on("session.execution.interrupted", stopChild),
-      context.data.on("session.execution.failed", (event) => finishChild(event, true)),
+      context.data.on("session.created", observe((event) => startChild(event, true))),
+      context.data.on("session.execution.started", observe(startChild)),
+      context.data.on("session.execution.succeeded", observe(finishChild)),
+      context.data.on("session.execution.interrupted", observe(stopChild)),
+      context.data.on("session.execution.failed", observe((event) => finishChild(event, true))),
       context.data.on("permission.asked", ({ data }) => changeBlocker(data.sessionID, "permission", data.id, true)),
       context.data.on("permission.replied", ({ data }) => changeBlocker(data.sessionID, "permission", data.requestID, false)),
       context.data.on("form.created", ({ data }) => changeBlocker(data.form.sessionID, "form", data.form.id, true)),
       context.data.on("form.replied", ({ data }) => changeBlocker(data.sessionID, "form", data.id, false)),
       context.data.on("form.cancelled", ({ data }) => changeBlocker(data.sessionID, "form", data.id, false)),
-      context.data.on("session.deleted", (event) => {
+      context.data.on("session.deleted", observe((event) => {
         updated.delete(event.data?.sessionID);
         closeChild(event.data?.sessionID, 0, true);
-      }),
+      })),
     );
 
-    syncNames();
-    titlePoll = setInterval(syncNames, TITLE_POLL_MS);
+    syncState();
+    titlePoll = setInterval(syncState, TITLE_POLL_MS);
     titlePoll.unref?.();
 
     return async () => {
@@ -841,7 +939,9 @@ export default {
       clearTimeout(titleRetry);
       clearTimeout(primaryRetry);
       clearTimeout(primaryStartup);
+      clearTimeout(recoveryRetry);
       updated.clear();
+      sessionEvents.clear();
       for (const unsubscribe of unsubscribers) unsubscribe();
       for (const child of children.values()) {
         cancelClose(child);

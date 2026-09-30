@@ -1,15 +1,31 @@
 # Herdr subagent panes
 
 This OpenCode V2 CLI plugin opens Herdr panes for child sessions and reports their
-state in the Herdr agent sidebar. By default, each pane runs:
+state in the Herdr agent sidebar. Each pane runs a small Node.js launcher. The
+launcher connects Mini to the existing OpenCode service:
 
 ```sh
-opencode2 mini --session <session-id>
+/absolute/path/to/opencode2 mini --server <service-url> --session <session-id>
 ```
 
-To use a launcher, set `commandPrefix` in the plugin options below.
-There is no built-in prefix. The plugin resolves a configured prefix executable
-once during setup and quotes each argument before adding it to the Mini command.
+The executable comes from the parent TUI's `process.execPath`. The explicit
+`--server` option prevents Mini from starting or replacing the shared service
+when the client and server versions differ.
+
+The launcher reads the local service registration and supplies its password
+through `OPENCODE_PASSWORD`. Passwords are not put in shell commands or Herdr
+arguments. Provider settings stay in the running service.
+
+When the service restarts, the launcher stops its old Mini client and connects
+the same session to the new service in the same pane. It checks the registration
+once per second. A missing registration or an unavailable service causes it to
+wait. It never starts a service. A normal Mini exit stays closed when the service
+is healthy. Closing the pane stops the launcher and its client.
+
+An optional `commandPrefix` can run Mini through a wrapper. The wrapper must
+accept the absolute OpenCode executable as its next argument and use `exec` to
+run it, so the launcher can stop the client. `devx` resolves tool names and does
+not accept this command form. Omit the prefix for a normal installation.
 
 The global CLI configuration can load this directory directly. No source copy
 or separate plugin config file is required.
@@ -18,9 +34,10 @@ or separate plugin config file is required.
 
 - The parent uses the full OpenCode V2 TUI and the local shared OpenCode service.
 - The TUI runs in a Herdr pane on macOS or Linux.
-- `herdr` and `ps` are available on `PATH` in the parent environment.
+- Node.js 22 or later, `herdr`, and `ps` are available on `PATH` in the parent environment.
+- The parent OpenCode executable remains available at its absolute path.
 - If configured, the prefix executable is available on `PATH` in the parent
-  environment. Without a prefix, `opencode2` must be available in the child shell.
+  environment and supports the wrapper contract above.
 - Herdr supports the 0.9 pane response format, including terminal IDs.
   Sidebar naming requires `pane report-metadata` with `--clear-title` support.
 
@@ -40,10 +57,23 @@ intentional; private and remote server support has not been added. It does not
 change or stop the parent session. The guard applies to normal CLI launches, not
 custom hosts that hide their connection arguments.
 
+The launcher reads `~/.local/state/opencode/service.json`, or the equivalent
+under `XDG_STATE_HOME`. It uses `service-local.json` for the local release
+channel and a channel-specific file for other custom channels. Only registered
+local HTTP endpoints are supported. Health checks verify the registered process
+and version before a client starts.
+
+After an update, reopen older full TUI windows once to load the new plugin.
+Existing windows can still have the previous pane launcher in memory.
+
 ## Pane lifecycle
 
 - Only children of the current session or enabled session tabs are selected.
   Nested child sessions are included through OpenCode's session-family lookup.
+- Setup, server reconnects, and changes to the selected session or enabled tabs
+  recover running children that have no tracked pane. Recovery uses at most three
+  attempts. Events received during recovery take precedence over the earlier
+  active-session response. Existing panes reconnect through their own launcher.
 - Each new pane uses the child session's current directory from OpenCode's cache.
   Missing data is synchronized. If the directory remains unknown, no pane opens.
 - The first worker opens to the right of the verified primary pane. The primary
@@ -124,7 +154,7 @@ height ratios. It does not apply a replacement layout or create a new tab.
 
 The parent TUI reports directly to Herdr for each pane that this plugin creates.
 It uses the native child session ID and the returned pane ID. Mini does not need
-to load a reporting plugin. There is no child launch wrapper.
+to load a reporting plugin. The child launcher handles only the client connection.
 
 | OpenCode state or event | Herdr state |
 | --- | --- |
@@ -217,14 +247,15 @@ For a checkout at `./plugins/herdr-subagent-panes`, use:
 ```
 
 Keep other plugins and settings when changing this entry. Remove `commandPrefix`
-or set it to `[]` to launch Mini directly. Use one array item per argument, such
+or set it to `[]` to launch Mini without a custom wrapper. Use one array item per argument, such
 as `["wrapper", "--flag"]`; do not supply a shell command string. The first item
 must name an executable, not a shell alias or function. Shell operators and
 variable expansion are not interpreted in prefix arguments.
 
-This option does not wait for dev-shell startup or Mini readiness. The plugin
-sends one command through Herdr's `pane run` after pane creation. The close delay
-starts when the child execution finishes, not when Mini becomes visible.
+This option does not wait for wrapper startup or Mini readiness. The plugin
+sends one launcher command through Herdr's `pane run` after pane creation. The
+launcher passes the prefix arguments to the client process without a shell.
+The close delay starts when the child execution finishes.
 
 | Option | Default | Accepted values |
 | --- | --- | --- |
@@ -260,6 +291,14 @@ OpenCode data, process information, and timers are replaced with test objects.
 The tests cannot create real panes or load the plugin into your current OpenCode.
 Node can print an experimental-VM warning; that warning is expected.
 
+Launcher tests cover mixed versions, service restarts, changed addresses and
+passwords, registration gaps, outages, normal exits, process cleanup, and shell
+quoting. Health tests use a local test HTTP server and temporary registration
+files. They do not use the installed OpenCode service or credentials.
+
+Recovery tests cover setup, reload, reconnects, session selection, missing cache
+entries, bounded retries, and session events received during a recovery request.
+
 Coverage includes inactive setup, stale environments, server restrictions, child
 directories, duplicate events, pane limits, resumed executions, close failures,
 terminal replacement, and completion or unload during a split. State tests cover
@@ -286,8 +325,19 @@ sessions and simulated lifecycle events. It makes no model calls. To run it,
 use only a disposable Herdr shell pane, from this repository directory:
 
 ```sh
+OPENCODE_TEST_BINARY=/absolute/path/to/opencode2 \
 node test/live-layout.mjs --disposable-pane
 ```
+
+The test uses explicit authenticated HTTP requests to the existing service. It
+checks that Mini starts with `--server`, plugin reload restores running panes,
+and the service PID, version, and model list stay the same. The test binary may
+be an older OpenCode version to check mixed-version attachment.
+
+On September 30, 2026, this check passed with a 2.0.14 Mini client and a 2.0.15
+shared service. Three worker panes opened, closed, and recovered after plugin
+reload. The service PID, version, and model list stayed the same. Temporary panes
+and sessions were removed after the check.
 
 ## API references
 
